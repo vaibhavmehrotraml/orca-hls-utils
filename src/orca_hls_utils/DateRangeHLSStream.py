@@ -37,6 +37,7 @@ class DateRangeHLSStream:
     end_unix_time
     wav_dir
     overwrite_output: allows ffmpeg to overwrite output, default is False
+    quiet_ffmpeg: Passed to ffmpeg.run quiet argument. Set true to print ffmpeg logs to stdout and stderr
     real_time: if False, get data as soon as possible, if true wait for
                 polling interval before pulling
     """
@@ -49,6 +50,7 @@ class DateRangeHLSStream:
         end_unix_time,
         wav_dir,
         overwrite_output=False,
+        quiet_ffmpeg=False,
         real_time=False,
     ):
         """ """
@@ -64,6 +66,7 @@ class DateRangeHLSStream:
         self.overwrite_output = overwrite_output
         self.real_time = real_time
         self.is_end_of_stream = False
+        self.quiet_ffmpeg = quiet_ffmpeg
 
         # Create wav dir if necessary
         Path(self.wav_dir).mkdir(parents=True, exist_ok=True)
@@ -200,7 +203,7 @@ class DateRangeHLSStream:
             stream = ffmpeg.input(os.path.join(tmp_path, Path(hls_file)))
             stream = ffmpeg.output(stream, wav_file_path)
             ffmpeg.run(
-                stream, overwrite_output=self.overwrite_output, quiet=False
+                stream, overwrite_output=self.overwrite_output, quiet=self.quiet_ffmpeg
             )
 
         # If we're in demo mode, we need to fake timestamps to make it seem
