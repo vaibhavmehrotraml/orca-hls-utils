@@ -156,13 +156,24 @@ class DateRangeHLSStream:
         segment_end_index = segment_start_index + num_segments_in_wav_duration
 
         if segment_end_index > num_total_segments:
-            # move to the next folder and increment the
-            # current_clip_start_time to the new
-            self.current_folder_index += 1
-            self.current_clip_start_time = self.valid_folders[
-                self.current_folder_index
-            ]
-            return None, None, None
+            if self.current_folder_index + 1 >= len(self.valid_folders):
+                # Something went wrong, we'll just return the current data
+                self.logger.warn("Missing data, returning truncated file.")
+                self.logger.debug(f"Start index is {segment_start_index}")
+                self.logger.debug(f"Adjusting end index from {segment_end_index} to {num_total_segments}")
+                segment_end_index = num_total_segments
+                if segment_end_index < segment_start_index:
+                    self.logger.warn("No data found")
+                    self.current_clip_start_time = self.end_unix_time
+                    return None, None, None
+            else:
+                # move to the next folder and increment the
+                # current_clip_start_time to the new
+                self.current_folder_index += 1
+                self.current_clip_start_time = self.valid_folders[
+                    self.current_folder_index
+                ]
+                return None, None, None
 
         # Can get the whole segment so update the clip_start_time for the next
         # clip
@@ -187,10 +198,12 @@ class DateRangeHLSStream:
                 try:
                     scraper.download_from_url(audio_url, tmp_path)
                     file_names.append(file_name)
+                    self.logger.debug(f"Adding file {file_name}")
                 except Exception:
                     self.logger.warning("Skipping", audio_url, ": error.")
 
             # concatentate all .ts files
+            self.logger.info(f"Files to concat = {file_names}")
             hls_file = os.path.join(tmp_path, Path(clipname + ".ts"))
             with open(hls_file, "wb") as wfd:
                 for f in file_names:
@@ -202,9 +215,13 @@ class DateRangeHLSStream:
             wav_file_path = os.path.join(self.wav_dir, audio_file)
             stream = ffmpeg.input(os.path.join(tmp_path, Path(hls_file)))
             stream = ffmpeg.output(stream, wav_file_path)
-            ffmpeg.run(
-                stream, overwrite_output=self.overwrite_output, quiet=self.quiet_ffmpeg
-            )
+            try:
+                ffmpeg.run(
+                    stream, overwrite_output=self.overwrite_output, quiet=self.quiet_ffmpeg
+                )
+            except Exception as e:
+                shutil.copyfile(hls_file, "ts/badfile.ts")
+                raise e
 
         # If we're in demo mode, we need to fake timestamps to make it seem
         # like the date range is real-time
