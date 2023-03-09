@@ -7,6 +7,7 @@ import time
 from datetime import datetime  # , timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import logging
 
 import ffmpeg
 import m3u8
@@ -52,6 +53,8 @@ class DateRangeHLSStream:
     ):
         """ """
 
+        self.logger = logging.getLogger("DateRangeHLSStream")
+
         # Get all necessary data and create index
         self.stream_base = stream_base
         self.polling_interval_in_seconds = polling_interval
@@ -87,7 +90,7 @@ class DateRangeHLSStream:
         all_hydrophone_folders = s3_utils.get_all_folders(
             self.s3_bucket, prefix=prefix
         )
-        print(
+        self.logger.info(
             "Found {} folders in all for hydrophone".format(
                 len(all_hydrophone_folders)
             )
@@ -96,7 +99,7 @@ class DateRangeHLSStream:
         self.valid_folders = s3_utils.get_folders_between_timestamp(
             all_hydrophone_folders, self.start_unix_time, self.end_unix_time
         )
-        print("Found {} folders in date range".format(len(self.valid_folders)))
+        self.logger.info("Found {} folders in date range".format(len(self.valid_folders)))
 
         self.current_folder_index = 0
         self.current_clip_start_time = self.start_unix_time
@@ -119,7 +122,7 @@ class DateRangeHLSStream:
             time_to_sleep = (current_clip_name - now).total_seconds()
 
             if time_to_sleep < 0:
-                print("Issue with timing")
+                self.logger.warning("Issue with timing")
 
             if time_to_sleep > 0:
                 time.sleep(time_to_sleep)
@@ -182,7 +185,7 @@ class DateRangeHLSStream:
                     scraper.download_from_url(audio_url, tmp_path)
                     file_names.append(file_name)
                 except Exception:
-                    print("Skipping", audio_url, ": error.")
+                    self.logger.warning("Skipping", audio_url, ": error.")
 
             # concatentate all .ts files
             hls_file = os.path.join(tmp_path, Path(clipname + ".ts"))
