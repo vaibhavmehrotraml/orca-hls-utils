@@ -137,6 +137,12 @@ class DateRangeHLSStream:
         )
         stream_obj = m3u8.load(stream_url)
         num_total_segments = len(stream_obj.segments)
+        if num_total_segments == 0:
+            self.current_folder_index += 1
+            self.current_clip_start_time = self.valid_folders[
+                self.current_folder_index
+            ]
+            return None, None, None
         target_duration = (
             sum([item.duration for item in stream_obj.segments])
             / num_total_segments
