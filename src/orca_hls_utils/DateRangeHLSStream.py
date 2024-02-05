@@ -5,6 +5,7 @@ import shutil
 # import sys
 import time
 from datetime import datetime  # , timedelta
+import datetime as dt
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from multiprocessing import Pool
@@ -16,6 +17,7 @@ import m3u8
 # from botocore import UNSIGNED
 # from botocore.config import Config
 from pytz import timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from . import datetime_utils, s3_utils, scraper
 
@@ -44,15 +46,15 @@ class DateRangeHLSStream:
     """
 
     def __init__(
-        self,
-        stream_base,
-        polling_interval,
-        start_unix_time,
-        end_unix_time,
-        wav_dir,
-        overwrite_output=False,
-        quiet_ffmpeg=False,
-        real_time=False,
+            self,
+            stream_base,
+            polling_interval,
+            start_unix_time,
+            end_unix_time,
+            wav_dir,
+            overwrite_output=False,
+            quiet_ffmpeg=False,
+            real_time=False,
     ):
         """ """
 
@@ -108,6 +110,8 @@ class DateRangeHLSStream:
         self.current_folder_index = 0
         self.current_clip_start_time = self.start_unix_time
 
+        self.clip_start_times = []
+
     def process_segment(self, args):
         base_path, file_name, tmp_path, logger = args
         audio_url = base_path + file_name
@@ -133,7 +137,7 @@ class DateRangeHLSStream:
         if self.real_time:
             # sleep till enough time has elapsed
 
-            now = datetime.utcnow()
+            now = dt.datetime.utcnow()
             time_to_sleep = (current_clip_name - now).total_seconds()
 
             if time_to_sleep < 0:
@@ -156,8 +160,8 @@ class DateRangeHLSStream:
             ]
             return None, None, None
         target_duration = (
-            sum([item.duration for item in stream_obj.segments])
-            / num_total_segments
+                sum([item.duration for item in stream_obj.segments])
+                / num_total_segments
         )
         num_segments_in_wav_duration = math.ceil(
             self.polling_interval_in_seconds / target_duration
@@ -210,8 +214,15 @@ class DateRangeHLSStream:
             # Use a multiprocessing Pool to download and process segments in parallel
             args_list = [(audio_segment.base_uri, audio_segment.uri, tmp_path, self.logger)
                          for audio_segment in stream_obj.segments[segment_start_index:segment_end_index]]
-            with Pool() as pool:
-                file_names = pool.map(self.process_segment, args_list)
+            file_names = []
+            with ThreadPoolExecutor() as executor:
+                # Submit tasks to the executor
+                futures = [executor.submit(self.process_segment, args) for args in args_list]
+                # Wait for all futures to complete
+                for future in futures:
+                    result = future.result()
+                    if result is not None:
+                        file_names.append(result)
 
             file_names = [f for f in file_names if f is not None]  # Filter out None results
 
@@ -258,3 +269,14 @@ class DateRangeHLSStream:
     def is_stream_over(self):
         # returns true or false based on whether the stream is over
         return int(self.current_clip_start_time) >= int(self.end_unix_time)
+
+#
+# if __name__ == '__main__':
+#     stream = DateRangeHLSStream(
+#         'https://s3-us-west-2.amazonaws.com/' + 'streaming-orcasound-net' + '/' + 'rpi_port_townsend',
+#         600,
+#         time.mktime(dt.datetime(2022, 2, 1, 1).timetuple()),
+#         time.mktime(dt.datetime(2022, 3, 1, 5).timetuple()),
+#         'test',
+#         True
+#     )
