@@ -5,18 +5,23 @@ import shutil
 # import sys
 import time
 from datetime import datetime  # , timedelta
+import datetime as dt
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import logging
+from multiprocessing import Pool
+from collections import defaultdict
+from tqdm import tqdm
 
+import logging
 import ffmpeg
 import m3u8
 
 # from botocore import UNSIGNED
 # from botocore.config import Config
 from pytz import timezone
+from concurrent.futures import ThreadPoolExecutor
 
-from . import datetime_utils, s3_utils, scraper
+from src.orca_hls_utils import datetime_utils, s3_utils, scraper
 
 
 def get_readable_clipname(hydrophone_id, cliptime_utc):
@@ -43,15 +48,15 @@ class DateRangeHLSStream:
     """
 
     def __init__(
-        self,
-        stream_base,
-        polling_interval,
-        start_unix_time,
-        end_unix_time,
-        wav_dir,
-        overwrite_output=False,
-        quiet_ffmpeg=False,
-        real_time=False,
+            self,
+            stream_base,
+            polling_interval,
+            start_unix_time,
+            end_unix_time,
+            wav_dir,
+            overwrite_output=False,
+            quiet_ffmpeg=False,
+            real_time=False,
     ):
         """ """
 
@@ -144,8 +149,8 @@ class DateRangeHLSStream:
             ]
             return None, None, None
         target_duration = (
-            sum([item.duration for item in stream_obj.segments])
-            / num_total_segments
+                sum([item.duration for item in stream_obj.segments])
+                / num_total_segments
         )
         num_segments_in_wav_duration = math.ceil(
             self.polling_interval_in_seconds / target_duration
@@ -160,7 +165,6 @@ class DateRangeHLSStream:
             / target_duration
         )
         segment_end_index = segment_start_index + num_segments_in_wav_duration
-
         if segment_end_index > num_total_segments:
             if self.current_folder_index + 1 >= len(self.valid_folders):
                 # Something went wrong, we'll just return the current data
@@ -251,3 +255,135 @@ class DateRangeHLSStream:
     def is_stream_over(self):
         # returns true or false based on whether the stream is over
         return int(self.current_clip_start_time) >= int(self.end_unix_time)
+
+    def get_all_clips(self):
+        segment_indexes = self.get_clips_from_folder()
+        segment_indexes_flattened = [x for xs in list(segment_indexes.values()) for x in xs]
+        with TemporaryDirectory() as tmp_path:
+            os.makedirs(tmp_path, exist_ok=True)
+            args_list = [(obj[2], obj[0], obj[1], obj[3], tmp_path, self.logger)
+                         for obj in segment_indexes_flattened]
+            with Pool() as pool:
+                wav_file_paths_and_clip_start_times = pool.map(self.download_clips_from_folder, args_list)
+
+            wav_file_paths = [f[0] for f in wav_file_paths_and_clip_start_times if f is not None]
+            wav_file_paths = [f for f in wav_file_paths if f is not None]
+            clip_start_times = [f[1]for f in wav_file_paths_and_clip_start_times if f is not None]
+            clip_start_times = [f for f in clip_start_times if f is not None]
+        return wav_file_paths, clip_start_times
+
+    def download_clips_from_folder(self, args):
+        current_clip_start_time, segment_start_index, segment_end_index, stream_obj, tmp_path, logger = args
+        clipname, clip_start_time, = datetime_utils.get_clip_name_from_unix_time(self.folder_name.replace("_", "-"),
+                                                                                 current_clip_start_time)
+        file_names = []
+        for i in range(segment_start_index, segment_end_index):
+            audio_segment = stream_obj.segments[i]
+            base_path = audio_segment.base_uri
+            file_name = audio_segment.uri
+            audio_url = base_path + file_name
+            # file_name = str(clip_start_time) + file_name
+            path_to_save = os.path.join(tmp_path, stream_obj.base_uri.split('/')[-2])
+            try:
+                os.makedirs(path_to_save, exist_ok=True)
+                scraper.download_from_url(audio_url, path_to_save)
+                file_names.append(file_name)
+                self.logger.debug(f"Adding file {file_name}")
+            except Exception as e:
+                self.logger.warning("Skipping", audio_url, ": error.", e)
+
+        self.logger.info(f"Files to concat = {file_names}")
+        hls_file = os.path.join(path_to_save, Path(clipname + ".ts"))
+        with open(hls_file, "wb") as wfd:
+            for f in file_names:
+                with open(os.path.join(path_to_save, f), "rb") as fd:
+                    shutil.copyfileobj(fd, wfd)
+
+        # read the concatenated .ts and write to wav
+        audio_file = clipname + ".wav"
+        wav_file_path = os.path.join(self.wav_dir, audio_file)
+        stream = ffmpeg.input(os.path.join(path_to_save, Path(hls_file)))
+        stream = ffmpeg.output(stream, wav_file_path)
+        try:
+            ffmpeg.run(
+                stream, overwrite_output=self.overwrite_output, quiet=self.quiet_ffmpeg
+            )
+        except Exception as e:
+            shutil.copyfile(hls_file, "ts/badfile.ts")
+            raise e
+
+        return wav_file_path, clip_start_time
+
+    def get_clips_from_folder(self):
+        # Setup list of current_folders and current_clip_start_times
+        segments_in_wav_duration = []
+        target_durations = []
+        segment_indexes = {}
+        stream_objects = []
+
+        for folder in tqdm(self.valid_folders):
+            stream_url = "{}/hls/{}/live.m3u8".format(self.stream_base, folder)
+            stream_obj = m3u8.load(stream_url)
+            stream_objects.append(stream_obj)
+            num_total_segments = len(stream_obj.segments)
+            target_duration = (
+                    sum([item.duration for item in stream_obj.segments])
+                    / num_total_segments
+            )
+            target_durations.append(target_duration)
+            num_segments_in_wav_duration = math.ceil(
+                self.polling_interval_in_seconds / target_duration
+            )
+            segments_in_wav_duration.append(num_segments_in_wav_duration)
+
+        i = 0
+        while not self.is_stream_over():
+            i += 1
+            current_folder = self.valid_folders[self.current_folder_index]
+            segment_start_index = math.ceil(
+                datetime_utils.get_difference_between_times_in_seconds(
+                    self.current_clip_start_time, current_folder
+                )
+                / target_durations[self.current_folder_index]
+            )
+            segment_end_index = segment_start_index + segments_in_wav_duration[self.current_folder_index]
+            if segment_end_index > num_total_segments:
+                self.current_folder_index += 1
+
+            if self.valid_folders[self.current_folder_index] not in segment_indexes.keys():
+                segment_indexes[self.valid_folders[self.current_folder_index]] = [(segment_start_index,
+                                                                                   segment_end_index,
+                                                                                   self.current_clip_start_time,
+                                                                                   stream_objects[
+                                                                                       self.current_folder_index])]
+                continue
+            segment_indexes[self.valid_folders[self.current_folder_index]].append((segment_start_index,
+                                                                                   segment_end_index,
+                                                                                   self.current_clip_start_time,
+                                                                                   stream_objects[
+                                                                                       self.current_folder_index]))
+
+            self.current_clip_start_time = (
+                datetime_utils.add_interval_to_unix_time(
+                    self.current_clip_start_time, self.polling_interval_in_seconds
+                )
+            )
+        print(f'Ran {i} iterations')
+
+        return segment_indexes
+
+
+if __name__ == '__main__':
+    ts = time.time()
+    stream = DateRangeHLSStream(
+        'https://s3-us-west-2.amazonaws.com/' + 'streaming-orcasound-net' + '/' + 'rpi_port_townsend',
+        600,
+        time.mktime(dt.datetime(2022, 2, 1, 1).timetuple()),
+        time.mktime(dt.datetime(2022, 2, 1, 5).timetuple()),
+        'test',
+        True)
+    print('Valid Folders = ', stream.valid_folders)
+    wav_files, clip_start_times = stream.get_all_clips()
+    # print(time.time() - ts)
+    # print(wav_files)
+    # print(len(wav_files))
