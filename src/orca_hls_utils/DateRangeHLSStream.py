@@ -372,18 +372,3 @@ class DateRangeHLSStream:
 
         return segment_indexes
 
-
-if __name__ == '__main__':
-    ts = time.time()
-    stream = DateRangeHLSStream(
-        'https://s3-us-west-2.amazonaws.com/' + 'streaming-orcasound-net' + '/' + 'rpi_port_townsend',
-        600,
-        time.mktime(dt.datetime(2022, 2, 1, 1).timetuple()),
-        time.mktime(dt.datetime(2022, 2, 1, 5).timetuple()),
-        'test',
-        True)
-    print('Valid Folders = ', stream.valid_folders)
-    wav_files, clip_start_times = stream.get_all_clips()
-    # print(time.time() - ts)
-    # print(wav_files)
-    # print(len(wav_files))
