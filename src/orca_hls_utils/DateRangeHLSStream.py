@@ -9,7 +9,7 @@ import datetime as dt
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from multiprocessing import Pool
-from collections import defaultdict
+
 from tqdm import tqdm
 
 import logging
@@ -21,7 +21,7 @@ import m3u8
 from pytz import timezone
 from concurrent.futures import ThreadPoolExecutor
 
-from src.orca_hls_utils import datetime_utils, s3_utils, scraper
+from . import datetime_utils, s3_utils, scraper
 
 
 def get_readable_clipname(hydrophone_id, cliptime_utc):
