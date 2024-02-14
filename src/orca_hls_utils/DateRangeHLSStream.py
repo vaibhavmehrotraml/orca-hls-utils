@@ -257,64 +257,65 @@ class DateRangeHLSStream:
         return int(self.current_clip_start_time) >= int(self.end_unix_time)
 
     def get_all_clips(self):
-        segment_indexes = self.get_clips_from_folder()
+        segment_indexes = self.setup_download_variables()
         segment_indexes_flattened = [x for xs in list(segment_indexes.values()) for x in xs]
         with TemporaryDirectory() as tmp_path:
-            os.makedirs(tmp_path, exist_ok=True)
             args_list = [(obj[2], obj[0], obj[1], obj[3], tmp_path, self.logger)
                          for obj in segment_indexes_flattened]
             with Pool() as pool:
                 wav_file_paths_and_clip_start_times = pool.map(self.download_clips_from_folder, args_list)
 
-            wav_file_paths = [f[0] for f in wav_file_paths_and_clip_start_times if f is not None]
-            wav_file_paths = [f for f in wav_file_paths if f is not None]
-            clip_start_times = [f[1]for f in wav_file_paths_and_clip_start_times if f is not None]
-            clip_start_times = [f for f in clip_start_times if f is not None]
+            wav_file_paths = [f[0] for f in wav_file_paths_and_clip_start_times if f[0] is not None]
+            clip_start_times = [f[1] for f in wav_file_paths_and_clip_start_times if f[1] is not None]
         return wav_file_paths, clip_start_times
 
     def download_clips_from_folder(self, args):
         current_clip_start_time, segment_start_index, segment_end_index, stream_obj, tmp_path, logger = args
-        clipname, clip_start_time, = datetime_utils.get_clip_name_from_unix_time(self.folder_name.replace("_", "-"),
-                                                                                 current_clip_start_time)
+        clipname, clip_start_time = datetime_utils.get_clip_name_from_unix_time(
+            self.folder_name.replace("_", "-"), current_clip_start_time)
+        path_to_save = os.path.join(tmp_path, stream_obj.base_uri.split('/')[-2])
+        os.makedirs(path_to_save, exist_ok=True)
+
         file_names = []
+
         for i in range(segment_start_index, segment_end_index):
             audio_segment = stream_obj.segments[i]
-            base_path = audio_segment.base_uri
-            file_name = audio_segment.uri
-            audio_url = base_path + file_name
-            # file_name = str(clip_start_time) + file_name
-            path_to_save = os.path.join(tmp_path, stream_obj.base_uri.split('/')[-2])
+            audio_url = audio_segment.base_uri + audio_segment.uri
             try:
-                os.makedirs(path_to_save, exist_ok=True)
                 scraper.download_from_url(audio_url, path_to_save)
-                file_names.append(file_name)
-                self.logger.debug(f"Adding file {file_name}")
+                file_names.append(audio_segment.uri)
+                logger.debug(f"Adding file {audio_segment.uri}")
             except Exception as e:
-                self.logger.warning("Skipping", audio_url, ": error.", e)
+                logger.warning(f"Skipping {audio_url}: error. {e}")
 
-        self.logger.info(f"Files to concat = {file_names}")
-        hls_file = os.path.join(path_to_save, Path(clipname + ".ts"))
-        with open(hls_file, "wb") as wfd:
-            for f in file_names:
-                with open(os.path.join(path_to_save, f), "rb") as fd:
-                    shutil.copyfileobj(fd, wfd)
-
-        # read the concatenated .ts and write to wav
-        audio_file = clipname + ".wav"
-        wav_file_path = os.path.join(self.wav_dir, audio_file)
-        stream = ffmpeg.input(os.path.join(path_to_save, Path(hls_file)))
-        stream = ffmpeg.output(stream, wav_file_path)
-        try:
-            ffmpeg.run(
-                stream, overwrite_output=self.overwrite_output, quiet=self.quiet_ffmpeg
-            )
-        except Exception as e:
-            shutil.copyfile(hls_file, "ts/badfile.ts")
-            raise e
+        logger.info(f"Files to concat = {file_names}")
+        hls_file = os.path.join(path_to_save, f"{clipname}.ts")
+        self.concatenate_files(file_names, path_to_save, hls_file)
+        wav_file_path = self.convert_ts_to_wav(hls_file, clipname)
 
         return wav_file_path, clip_start_time
 
-    def get_clips_from_folder(self):
+    def concatenate_files(self, file_names, directory, output_file):
+        with open(output_file, "wb") as wfd:
+            for file_name in file_names:
+                file_path = os.path.join(directory, file_name)
+                with open(file_path, "rb") as fd:
+                    shutil.copyfileobj(fd, wfd)
+
+    def convert_ts_to_wav(self, input_file, clipname):
+        audio_file = f"{clipname}.wav"
+        wav_file_path = os.path.join(self.wav_dir, audio_file)
+        stream = ffmpeg.input(input_file)
+        stream = ffmpeg.output(stream, wav_file_path)
+        try:
+            ffmpeg.run(stream, quiet=self.quiet_ffmpeg, overwrite_output=self.overwrite_output)
+        except Exception as e:
+            bad_file_path = os.path.join("ts", "badfile.ts")
+            shutil.copyfile(input_file, bad_file_path)
+            raise e
+        return wav_file_path
+
+    def setup_download_variables(self):
         # Setup list of current_folders and current_clip_start_times
         segments_in_wav_duration = []
         target_durations = []
@@ -325,29 +326,25 @@ class DateRangeHLSStream:
             stream_url = "{}/hls/{}/live.m3u8".format(self.stream_base, folder)
             stream_obj = m3u8.load(stream_url)
             stream_objects.append(stream_obj)
+
             num_total_segments = len(stream_obj.segments)
-            target_duration = (
-                    sum([item.duration for item in stream_obj.segments])
-                    / num_total_segments
-            )
+            target_duration = sum([item.duration for item in stream_obj.segments]) / num_total_segments
             target_durations.append(target_duration)
+
             num_segments_in_wav_duration = math.ceil(
                 self.polling_interval_in_seconds / target_duration
             )
             segments_in_wav_duration.append(num_segments_in_wav_duration)
 
-        i = 0
+        counter = 0
         while not self.is_stream_over():
-            i += 1
+            counter += 1
             current_folder = self.valid_folders[self.current_folder_index]
-            segment_start_index = math.ceil(
-                datetime_utils.get_difference_between_times_in_seconds(
-                    self.current_clip_start_time, current_folder
-                )
-                / target_durations[self.current_folder_index]
-            )
+            segment_start_index = math.ceil(datetime_utils.get_difference_between_times_in_seconds(
+                self.current_clip_start_time, current_folder) / target_durations[self.current_folder_index])
             segment_end_index = segment_start_index + segments_in_wav_duration[self.current_folder_index]
-            if segment_end_index > num_total_segments:
+
+            if segment_end_index >= num_total_segments:
                 self.current_folder_index += 1
 
             if self.valid_folders[self.current_folder_index] not in segment_indexes.keys():
@@ -368,7 +365,6 @@ class DateRangeHLSStream:
                     self.current_clip_start_time, self.polling_interval_in_seconds
                 )
             )
-        print(f'Ran {i} iterations')
-
+        self.logger.info(f'Ran {counter} iterations')
         return segment_indexes
 
