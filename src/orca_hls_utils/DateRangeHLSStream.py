@@ -10,6 +10,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from multiprocessing import Pool
 
+from tqdm import tqdm
+
 import logging
 import ffmpeg
 import m3u8
@@ -110,19 +112,6 @@ class DateRangeHLSStream:
         self.current_folder_index = 0
         self.current_clip_start_time = self.start_unix_time
 
-        self.clip_start_times = []
-
-    def process_segment(self, args):
-        base_path, file_name, tmp_path, logger = args
-        audio_url = base_path + file_name
-        try:
-            scraper.download_from_url(audio_url, tmp_path)
-            logger.debug(f"Adding file {file_name}")
-            return file_name
-        except Exception as e:
-            logger.warning("Skipping", audio_url, ": error.")
-            return None
-
     def get_next_clip(self, current_clip_name=None):
         # Get current folder
         current_folder = int(self.valid_folders[self.current_folder_index])
@@ -137,7 +126,7 @@ class DateRangeHLSStream:
         if self.real_time:
             # sleep till enough time has elapsed
 
-            now = dt.datetime.utcnow()
+            now = datetime.utcnow()
             time_to_sleep = (current_clip_name - now).total_seconds()
 
             if time_to_sleep < 0:
@@ -176,7 +165,6 @@ class DateRangeHLSStream:
             / target_duration
         )
         segment_end_index = segment_start_index + num_segments_in_wav_duration
-
         if segment_end_index > num_total_segments:
             if self.current_folder_index + 1 >= len(self.valid_folders):
                 # Something went wrong, we'll just return the current data
@@ -211,20 +199,18 @@ class DateRangeHLSStream:
         with TemporaryDirectory() as tmp_path:
             os.makedirs(tmp_path, exist_ok=True)
 
-            # Use a multiprocessing Pool to download and process segments in parallel
-            args_list = [(audio_segment.base_uri, audio_segment.uri, tmp_path, self.logger)
-                         for audio_segment in stream_obj.segments[segment_start_index:segment_end_index]]
             file_names = []
-            with ThreadPoolExecutor() as executor:
-                # Submit tasks to the executor
-                futures = [executor.submit(self.process_segment, args) for args in args_list]
-                # Wait for all futures to complete
-                for future in futures:
-                    result = future.result()
-                    if result is not None:
-                        file_names.append(result)
-
-            file_names = [f for f in file_names if f is not None]  # Filter out None results
+            for i in range(segment_start_index, segment_end_index):
+                audio_segment = stream_obj.segments[i]
+                base_path = audio_segment.base_uri
+                file_name = audio_segment.uri
+                audio_url = base_path + file_name
+                try:
+                    scraper.download_from_url(audio_url, tmp_path)
+                    file_names.append(file_name)
+                    self.logger.debug(f"Adding file {file_name}")
+                except Exception:
+                    self.logger.warning("Skipping", audio_url, ": error.")
 
             # concatentate all .ts files
             self.logger.info(f"Files to concat = {file_names}")
@@ -270,13 +256,115 @@ class DateRangeHLSStream:
         # returns true or false based on whether the stream is over
         return int(self.current_clip_start_time) >= int(self.end_unix_time)
 
-#
-# if __name__ == '__main__':
-#     stream = DateRangeHLSStream(
-#         'https://s3-us-west-2.amazonaws.com/' + 'streaming-orcasound-net' + '/' + 'rpi_port_townsend',
-#         600,
-#         time.mktime(dt.datetime(2022, 2, 1, 1).timetuple()),
-#         time.mktime(dt.datetime(2022, 3, 1, 5).timetuple()),
-#         'test',
-#         True
-#     )
+    def get_all_clips(self):
+        segment_indexes = self.setup_download_variables()
+        segment_indexes_flattened = [x for xs in list(segment_indexes.values()) for x in xs]
+        with TemporaryDirectory() as tmp_path:
+            args_list = [(obj[2], obj[0], obj[1], obj[3], tmp_path, self.logger)
+                         for obj in segment_indexes_flattened]
+            with Pool() as pool:
+                wav_file_paths_and_clip_start_times = pool.map(self.download_clips_from_folder, args_list)
+
+            wav_file_paths = [f[0] for f in wav_file_paths_and_clip_start_times if f[0] is not None]
+            clip_start_times = [f[1] for f in wav_file_paths_and_clip_start_times if f[1] is not None]
+        return wav_file_paths, clip_start_times
+
+    def download_clips_from_folder(self, args):
+        current_clip_start_time, segment_start_index, segment_end_index, stream_obj, tmp_path, logger = args
+        clipname, clip_start_time = datetime_utils.get_clip_name_from_unix_time(
+            self.folder_name.replace("_", "-"), current_clip_start_time)
+        path_to_save = os.path.join(tmp_path, stream_obj.base_uri.split('/')[-2])
+        os.makedirs(path_to_save, exist_ok=True)
+
+        file_names = []
+
+        for i in range(segment_start_index, segment_end_index):
+            audio_segment = stream_obj.segments[i]
+            audio_url = audio_segment.base_uri + audio_segment.uri
+            try:
+                scraper.download_from_url(audio_url, path_to_save)
+                file_names.append(audio_segment.uri)
+                logger.debug(f"Adding file {audio_segment.uri}")
+            except Exception as e:
+                logger.warning(f"Skipping {audio_url}: error. {e}")
+
+        logger.info(f"Files to concat = {file_names}")
+        hls_file = os.path.join(path_to_save, f"{clipname}.ts")
+        self.concatenate_files(file_names, path_to_save, hls_file)
+        wav_file_path = self.convert_ts_to_wav(hls_file, clipname)
+
+        return wav_file_path, clip_start_time
+
+    def concatenate_files(self, file_names, directory, output_file):
+        with open(output_file, "wb") as wfd:
+            for file_name in file_names:
+                file_path = os.path.join(directory, file_name)
+                with open(file_path, "rb") as fd:
+                    shutil.copyfileobj(fd, wfd)
+
+    def convert_ts_to_wav(self, input_file, clipname):
+        audio_file = f"{clipname}.wav"
+        wav_file_path = os.path.join(self.wav_dir, audio_file)
+        stream = ffmpeg.input(input_file)
+        stream = ffmpeg.output(stream, wav_file_path)
+        try:
+            ffmpeg.run(stream, quiet=self.quiet_ffmpeg, overwrite_output=self.overwrite_output)
+        except Exception as e:
+            bad_file_path = os.path.join("ts", "badfile.ts")
+            shutil.copyfile(input_file, bad_file_path)
+            raise e
+        return wav_file_path
+
+    def setup_download_variables(self):
+        # Setup list of current_folders and current_clip_start_times
+        segments_in_wav_duration = []
+        target_durations = []
+        segment_indexes = {}
+        stream_objects = []
+
+        for folder in tqdm(self.valid_folders):
+            stream_url = "{}/hls/{}/live.m3u8".format(self.stream_base, folder)
+            stream_obj = m3u8.load(stream_url)
+            stream_objects.append(stream_obj)
+
+            num_total_segments = len(stream_obj.segments)
+            target_duration = sum([item.duration for item in stream_obj.segments]) / num_total_segments
+            target_durations.append(target_duration)
+
+            num_segments_in_wav_duration = math.ceil(
+                self.polling_interval_in_seconds / target_duration
+            )
+            segments_in_wav_duration.append(num_segments_in_wav_duration)
+
+        counter = 0
+        while not self.is_stream_over():
+            counter += 1
+            current_folder = self.valid_folders[self.current_folder_index]
+            segment_start_index = math.ceil(datetime_utils.get_difference_between_times_in_seconds(
+                self.current_clip_start_time, current_folder) / target_durations[self.current_folder_index])
+            segment_end_index = segment_start_index + segments_in_wav_duration[self.current_folder_index]
+
+            if segment_end_index >= num_total_segments:
+                self.current_folder_index += 1
+
+            if self.valid_folders[self.current_folder_index] not in segment_indexes.keys():
+                segment_indexes[self.valid_folders[self.current_folder_index]] = [(segment_start_index,
+                                                                                   segment_end_index,
+                                                                                   self.current_clip_start_time,
+                                                                                   stream_objects[
+                                                                                       self.current_folder_index])]
+                continue
+            segment_indexes[self.valid_folders[self.current_folder_index]].append((segment_start_index,
+                                                                                   segment_end_index,
+                                                                                   self.current_clip_start_time,
+                                                                                   stream_objects[
+                                                                                       self.current_folder_index]))
+
+            self.current_clip_start_time = (
+                datetime_utils.add_interval_to_unix_time(
+                    self.current_clip_start_time, self.polling_interval_in_seconds
+                )
+            )
+        self.logger.info(f'Ran {counter} iterations')
+        return segment_indexes
+
