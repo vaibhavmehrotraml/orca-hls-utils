@@ -112,6 +112,17 @@ class DateRangeHLSStream:
         self.current_folder_index = 0
         self.current_clip_start_time = self.start_unix_time
 
+    def process_segment(self, args):
+        base_path, file_name, tmp_path, logger = args
+        audio_url = base_path + file_name
+        try:
+            scraper.download_from_url(audio_url, tmp_path)
+            logger.debug(f"Adding file {file_name}")
+            return file_name
+        except Exception as e:
+            logger.warning("Skipping", audio_url, ": error.")
+            return None
+
     def get_next_clip(self, current_clip_name=None):
         # Get current folder
         current_folder = int(self.valid_folders[self.current_folder_index])
@@ -126,7 +137,7 @@ class DateRangeHLSStream:
         if self.real_time:
             # sleep till enough time has elapsed
 
-            now = datetime.utcnow()
+            now = dt.datetime.utcnow()
             time_to_sleep = (current_clip_name - now).total_seconds()
 
             if time_to_sleep < 0:
@@ -165,6 +176,7 @@ class DateRangeHLSStream:
             / target_duration
         )
         segment_end_index = segment_start_index + num_segments_in_wav_duration
+
         if segment_end_index > num_total_segments:
             if self.current_folder_index + 1 >= len(self.valid_folders):
                 # Something went wrong, we'll just return the current data
@@ -199,18 +211,20 @@ class DateRangeHLSStream:
         with TemporaryDirectory() as tmp_path:
             os.makedirs(tmp_path, exist_ok=True)
 
+            # Use a multiprocessing Pool to download and process segments in parallel
+            args_list = [(audio_segment.base_uri, audio_segment.uri, tmp_path, self.logger)
+                         for audio_segment in stream_obj.segments[segment_start_index:segment_end_index]]
             file_names = []
-            for i in range(segment_start_index, segment_end_index):
-                audio_segment = stream_obj.segments[i]
-                base_path = audio_segment.base_uri
-                file_name = audio_segment.uri
-                audio_url = base_path + file_name
-                try:
-                    scraper.download_from_url(audio_url, tmp_path)
-                    file_names.append(file_name)
-                    self.logger.debug(f"Adding file {file_name}")
-                except Exception:
-                    self.logger.warning("Skipping", audio_url, ": error.")
+            with ThreadPoolExecutor() as executor:
+                # Submit tasks to the executor
+                futures = [executor.submit(self.process_segment, args) for args in args_list]
+                # Wait for all futures to complete
+                for future in futures:
+                    result = future.result()
+                    if result is not None:
+                        file_names.append(result)
+
+            file_names = [f for f in file_names if f is not None]  # Filter out None results
 
             # concatentate all .ts files
             self.logger.info(f"Files to concat = {file_names}")
@@ -367,4 +381,3 @@ class DateRangeHLSStream:
             )
         self.logger.info(f'Ran {counter} iterations')
         return segment_indexes
-
