@@ -152,7 +152,6 @@ def download_from_url(dl_url, dl_dir):
     if os.path.isfile(dl_path):
         print("Skipping", file_name, "as it already exists.")
     else:
-        print("Downloading", file_name)
         with TqdmUpTo(
             unit="B", unit_scale=True, miniters=1, desc=dl_url.split("/")[-1]
         ) as t:  # all optional kwargs
