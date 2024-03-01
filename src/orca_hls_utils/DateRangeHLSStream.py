@@ -358,7 +358,7 @@ class DateRangeHLSStream:
                 self.current_clip_start_time, current_folder) / target_durations[self.current_folder_index])
             segment_end_index = segment_start_index + segments_in_wav_duration[self.current_folder_index]
 
-            if segment_end_index >= num_total_segments:
+            if segment_end_index > num_total_segments:
                 self.current_folder_index += 1
 
             if self.valid_folders[self.current_folder_index] not in segment_indexes.keys():
