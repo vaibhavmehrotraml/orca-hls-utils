@@ -291,7 +291,6 @@ class DateRangeHLSStream:
         os.makedirs(path_to_save, exist_ok=True)
 
         file_names = []
-
         for i in range(segment_start_index, segment_end_index):
             audio_segment = stream_obj.segments[i]
             audio_url = audio_segment.base_uri + audio_segment.uri
@@ -359,7 +358,12 @@ class DateRangeHLSStream:
             segment_end_index = segment_start_index + segments_in_wav_duration[self.current_folder_index]
 
             if segment_end_index > num_total_segments:
-                self.current_folder_index += 1
+                segment_end_index = num_total_segments
+                if self.current_folder_index + 1 >= len(self.valid_folders):
+                    pass
+                else:
+                    self.current_folder_index += 1
+                    self.current_clip_start_time = self.valid_folders[self.current_folder_index]
 
             if self.valid_folders[self.current_folder_index] not in segment_indexes.keys():
                 segment_indexes[self.valid_folders[self.current_folder_index]] = [(segment_start_index,
@@ -367,6 +371,9 @@ class DateRangeHLSStream:
                                                                                    self.current_clip_start_time,
                                                                                    stream_objects[
                                                                                        self.current_folder_index])]
+
+                self.current_clip_start_time = (datetime_utils.add_interval_to_unix_time(
+                    self.current_clip_start_time, self.polling_interval_in_seconds))
                 continue
             segment_indexes[self.valid_folders[self.current_folder_index]].append((segment_start_index,
                                                                                    segment_end_index,
